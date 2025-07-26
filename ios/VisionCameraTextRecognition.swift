@@ -7,6 +7,7 @@ import MLKitTextRecognitionDevanagari
 import MLKitTextRecognitionJapanese
 import MLKitTextRecognitionKorean
 import MLKitCommon
+import CoreImage
 
 @objc(VisionCameraTextRecognition)
 public class VisionCameraTextRecognition: FrameProcessorPlugin {
@@ -18,6 +19,10 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
     private static let japaneseOptions = JapaneseTextRecognizerOptions()
     private static let koreanOptions = KoreanTextRecognizerOptions()
     private var data: [String: Any] = [:]
+
+    // Used when converting the frame pixel format.
+    private let context = CIContext(options: nil)
+    private var bufferPool: CVPixelBufferPool?
 
 
     public override init(proxy: VisionCameraProxyHolder, options: [AnyHashable: Any]! = [:]) {
@@ -40,7 +45,40 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
 
     public override func callback(_ frame: Frame, withArguments arguments: [AnyHashable: Any]?) -> Any {
         let buffer = frame.buffer
-        let image = VisionImage(buffer: buffer)
+        let pixelFormat = frame.pixelFormat
+        let image: VisionImage
+
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(buffer) else {
+            print("Failed to get CVPixelBuffer from frame.")
+            return [:]
+       }
+
+        let pixelFormatType = CVPixelBufferGetPixelFormatType(pixelBuffer)
+
+        // These are the accepted MLKit pixel formats.
+        let compatibleFormats: [OSType] = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            kCVPixelFormatType_32BGRA
+        ]
+
+        // Make sure the frame pixel format is compatible.
+        if compatibleFormats.contains(pixelFormatType) {
+            image = VisionImage(buffer: buffer)
+        } else {
+            guard let bgraPixelBuffer = convertToBGRA(from: pixelBuffer) else {
+                print("Failed to convert pixel buffer to BGRA.")
+                return [:]
+            }
+
+            guard let newSampleBuffer = createSampleBuffer(from: bgraPixelBuffer, withTimingFrom: frame.buffer) else {
+                print("Failed to create new sample buffer.")
+                return [:]
+            }
+
+            image = VisionImage(buffer: newSampleBuffer)
+        }
+
         image.orientation = getOrientation(orientation: frame.orientation)
 
         do {
@@ -59,7 +97,80 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
         }
     }
 
-      static func processBlocks(blocks:[TextBlock]) -> Array<Any> {
+    /**
+     * Converts a CVPixelBuffer from an unknown YUV format to kCVPixelFormatType_32BGRA.
+     */
+    private func convertToBGRA(from pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        // Create a CIImage from the source pixel buffer
+        let sourceImage = CIImage(cvPixelBuffer: pixelBuffer)
+
+        // On the first run, create a buffer pool with the correct BGRA format.
+        // The pool is expensive to create, so we only do it once.
+        if bufferPool == nil {
+            let poolAttributes = [kCVPixelBufferPoolMinimumBufferCountKey: 3] as CFDictionary
+            let bufferAttributes = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey: CVPixelBufferGetWidth(pixelBuffer),
+                kCVPixelBufferHeightKey: CVPixelBufferGetHeight(pixelBuffer),
+                kCVPixelFormatOpenGLESCompatibility: true,
+                kCVPixelBufferIOSurfacePropertiesKey: [:]
+            ] as CFDictionary
+            let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttributes, bufferAttributes, &bufferPool)
+            if status != kCVReturnSuccess {
+                print("Failed to create CVPixelBufferPool. Status: \(status)")
+                return nil
+            }
+        }
+
+        // Pull a new, empty CVPixelBuffer from our pool. This is much faster than allocating a new one.
+        var convertedPixelBuffer: CVPixelBuffer?
+        guard let pool = bufferPool,
+              CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &convertedPixelBuffer) == kCVReturnSuccess,
+              let finalBuffer = convertedPixelBuffer else {
+            print("Failed to create pixel buffer from pool.")
+            return nil
+        }
+
+        // Render the CIImage into our new, empty, BGRA-formatted CVPixelBuffer.
+        // This render operation is executed on the GPU and is extremely fast.
+        self.context.render(sourceImage, to: finalBuffer)
+
+        return finalBuffer
+    }
+
+     /**
+     * Creates a new CMSampleBuffer around a CVPixelBuffer.
+     * It copies the timing information from the original sample buffer.
+     */
+    private func createSampleBuffer(from pixelBuffer: CVPixelBuffer, withTimingFrom originalBuffer: CMSampleBuffer) -> CMSampleBuffer? {
+        var timingInfo = CMSampleTimingInfo()
+        guard CMSampleBufferGetSampleTimingInfo(originalBuffer, at: 0, timingInfoOut: &timingInfo) == noErr else {
+            print("Failed to get timing info from original buffer.")
+            return nil
+        }
+
+        var videoInfo: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+                                                           imageBuffer: pixelBuffer,
+                                                           formatDescriptionOut: &videoInfo) == noErr else {
+            print("Failed to create video format description.")
+            return nil
+        }
+
+        do {
+            let sampleBuffer = try CMSampleBuffer(imageBuffer: pixelBuffer,
+                                                  formatDescription: videoInfo!,
+                                                  sampleTiming: timingInfo)
+            return sampleBuffer
+        } catch {
+            print("Failed to create sample buffer from image buffer: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+
+
+    static func processBlocks(blocks:[TextBlock]) -> Array<Any> {
         var blocksArray : [Any] = []
         for block in blocks {
             var blockData : [String:Any] = [:]
